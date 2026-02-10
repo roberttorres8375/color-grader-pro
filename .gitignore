@@ -1,0 +1,10 @@
+node_modules/
+.next/
+out/
+tmp/
+public/output/
+public/uploads/
+*.tsbuildinfo
+.env
+.env.local
+.DS_Store
