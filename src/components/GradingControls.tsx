@@ -1,12 +1,14 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useCallback } from "react";
 import { Slider } from "./Slider";
 import { ColorWheel } from "./ColorWheel";
 import {
   DEFAULT_PARAMS,
   PRESETS,
   type GradingParams,
+  type ColorWheelValue,
+  type ColorBalance,
   type Preset,
 } from "@/lib/color-science";
 
@@ -19,6 +21,46 @@ interface GradingControlsProps {
 
 type Tab = "basic" | "wheels" | "curves" | "presets";
 
+/** Linearly interpolate between two numbers */
+function lerp(a: number, b: number, t: number): number {
+  return a + (b - a) * t;
+}
+
+/** Interpolate between default and preset params at a given intensity (0-100) */
+function interpolateParams(preset: Preset, intensity: number): GradingParams {
+  const t = intensity / 100;
+  const d = DEFAULT_PARAMS;
+  const p = { ...DEFAULT_PARAMS, ...preset.params };
+
+  const lerpWheel = (dw: ColorWheelValue, pw: ColorWheelValue): ColorWheelValue => ({
+    r: lerp(dw.r, pw.r, t),
+    g: lerp(dw.g, pw.g, t),
+    b: lerp(dw.b, pw.b, t),
+    master: lerp(dw.master, pw.master, t),
+  });
+
+  const lerpBalance = (db: ColorBalance, pb: ColorBalance): ColorBalance => ({
+    r: lerp(db.r, pb.r, t),
+    g: lerp(db.g, pb.g, t),
+    b: lerp(db.b, pb.b, t),
+  });
+
+  return {
+    exposure: lerp(d.exposure, p.exposure, t),
+    contrast: lerp(d.contrast, p.contrast, t),
+    contrastPivot: lerp(d.contrastPivot, p.contrastPivot, t),
+    saturation: lerp(d.saturation, p.saturation, t),
+    temperature: lerp(d.temperature, p.temperature, t),
+    tint: lerp(d.tint, p.tint, t),
+    lift: lerpWheel(d.lift, p.lift),
+    gamma: lerpWheel(d.gamma, p.gamma),
+    gain: lerpWheel(d.gain, p.gain),
+    shadows: lerpBalance(d.shadows, p.shadows),
+    midtones: lerpBalance(d.midtones, p.midtones),
+    highlights: lerpBalance(d.highlights, p.highlights),
+  };
+}
+
 export function GradingControls({
   params,
   onChange,
@@ -27,19 +69,30 @@ export function GradingControls({
 }: GradingControlsProps) {
   const [tab, setTab] = useState<Tab>("basic");
   const [activePreset, setActivePreset] = useState<string | null>(null);
+  const [presetIntensity, setPresetIntensity] = useState(100);
 
   const update = (partial: Partial<GradingParams>) => {
     setActivePreset(null);
     onChange({ ...params, ...partial });
   };
 
-  const applyPreset = (preset: Preset) => {
+  const applyPreset = useCallback((preset: Preset) => {
     setActivePreset(preset.name);
+    setPresetIntensity(100);
     onChange({ ...DEFAULT_PARAMS, ...preset.params });
-  };
+  }, [onChange]);
+
+  const handleIntensityChange = useCallback((intensity: number) => {
+    setPresetIntensity(intensity);
+    const preset = PRESETS.find((p) => p.name === activePreset);
+    if (preset) {
+      onChange(interpolateParams(preset, intensity));
+    }
+  }, [activePreset, onChange]);
 
   const resetAll = () => {
     setActivePreset(null);
+    setPresetIntensity(100);
     onChange({ ...DEFAULT_PARAMS });
   };
 
@@ -195,6 +248,22 @@ export function GradingControls({
                   </button>
                 ))}
               </div>
+
+              {/* Preset intensity slider */}
+              {activePreset && (
+                <div className="mt-3 pt-3 border-t border-[#2a2a2a]">
+                  <Slider
+                    label="Intensity"
+                    value={presetIntensity}
+                    min={0}
+                    max={100}
+                    step={1}
+                    defaultValue={100}
+                    unit="%"
+                    onChange={handleIntensityChange}
+                  />
+                </div>
+              )}
             </Section>
 
             <Section title="LUT">

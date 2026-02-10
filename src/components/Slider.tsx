@@ -48,7 +48,9 @@ export function Slider({
         step={step}
         value={value}
         onChange={(e) => onChange(parseFloat(e.target.value))}
+        onDoubleClick={handleReset}
         className="w-full"
+        title="Double-click to reset"
       />
     </div>
   );
