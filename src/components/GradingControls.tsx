@@ -50,6 +50,8 @@ function interpolateParams(preset: Preset, intensity: number): GradingParams {
     contrast: lerp(d.contrast, p.contrast, t),
     contrastPivot: lerp(d.contrastPivot, p.contrastPivot, t),
     saturation: lerp(d.saturation, p.saturation, t),
+    shadowsLevel: lerp(d.shadowsLevel, p.shadowsLevel, t),
+    highlightsLevel: lerp(d.highlightsLevel, p.highlightsLevel, t),
     temperature: lerp(d.temperature, p.temperature, t),
     tint: lerp(d.tint, p.tint, t),
     lift: lerpWheel(d.lift, p.lift),
@@ -147,6 +149,22 @@ export function GradingControls({
                 defaultValue={100}
                 unit="%"
                 onChange={(v) => update({ saturation: v })}
+              />
+              <Slider
+                label="Shadows"
+                value={params.shadowsLevel}
+                min={-100}
+                max={100}
+                step={1}
+                onChange={(v) => update({ shadowsLevel: v })}
+              />
+              <Slider
+                label="Highlights"
+                value={params.highlightsLevel}
+                min={-100}
+                max={100}
+                step={1}
+                onChange={(v) => update({ highlightsLevel: v })}
               />
             </Section>
 

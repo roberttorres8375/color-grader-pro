@@ -14,6 +14,8 @@ export interface GradingParams {
   contrast: number;       // S-curve intensity. Range: -100 to +100
   contrastPivot: number;  // Pivot point for contrast (0.18 = middle gray). Range: 0.0 to 1.0
   saturation: number;     // Global saturation multiplier. Range: 0 to 200 (100 = no change)
+  shadowsLevel: number;   // Luminance-isolated shadows brightness. Range: -100 to +100
+  highlightsLevel: number; // Luminance-isolated highlights brightness. Range: -100 to +100
 
   // Color temperature
   temperature: number;    // Warm/cool shift in mireds. Range: -100 to +100
@@ -58,6 +60,8 @@ export const DEFAULT_PARAMS: GradingParams = {
   contrast: 0,
   contrastPivot: 0.18,
   saturation: 100,
+  shadowsLevel: 0,
+  highlightsLevel: 0,
   temperature: 0,
   tint: 0,
   lift:       { r: 0, g: 0, b: 0, master: 0 },
@@ -267,7 +271,24 @@ export function generateFFmpegFilterChain(params: GradingParams): string {
     filters.push(`eq=saturation=${sat.toFixed(3)}`);
   }
 
-  // 6. Shadows/Midtones/Highlights color balance
+  // 6. Shadows/Highlights level via curves
+  if (params.shadowsLevel !== 0 || params.highlightsLevel !== 0) {
+    const sl = params.shadowsLevel / 100;
+    const hl = params.highlightsLevel / 100;
+    // Approximate luminance-isolated adjustments via a curves filter
+    const points: string[] = [];
+    const numPts = 12;
+    for (let i = 0; i <= numPts; i++) {
+      const x = i / numPts;
+      const shadowWeight = 1.0 - smoothstep(0.0, 0.5, x);
+      const highlightWeight = smoothstep(0.5, 1.0, x);
+      const y = Math.max(0, Math.min(1, x + sl * shadowWeight + hl * highlightWeight));
+      points.push(`${x.toFixed(3)}/${y.toFixed(3)}`);
+    }
+    filters.push(`curves=all=${points.join(" ")}`);
+  }
+
+  // 7. Shadows/Midtones/Highlights color balance
   const hasSMH = [params.shadows, params.midtones, params.highlights].some(
     v => v.r !== 0 || v.g !== 0 || v.b !== 0
   );
@@ -417,7 +438,18 @@ function applyGradingToPixel(r: number, g: number, b: number, params: GradingPar
     b = luma + sat * (b - luma);
   }
 
-  // 6. Shadows/Midtones/Highlights color balance
+  // 6. Shadows/Highlights level (luminance-isolated brightness)
+  if (params.shadowsLevel !== 0 || params.highlightsLevel !== 0) {
+    const lumaLev = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    const shadowWeight = 1.0 - smoothstep(0.0, 0.5, lumaLev);
+    const highlightWeight = smoothstep(0.5, 1.0, lumaLev);
+    const adj = (params.shadowsLevel / 100) * shadowWeight + (params.highlightsLevel / 100) * highlightWeight;
+    r = Math.max(0, Math.min(1, r + adj));
+    g = Math.max(0, Math.min(1, g + adj));
+    b = Math.max(0, Math.min(1, b + adj));
+  }
+
+  // 7. Shadows/Midtones/Highlights color balance
   const hasSMH = [params.shadows, params.midtones, params.highlights].some(
     v => v.r !== 0 || v.g !== 0 || v.b !== 0
   );
@@ -512,7 +544,17 @@ void main() {
   color = vec3(luma) + sat * (color - vec3(luma));
   ` : '// No saturation change'}
 
-  // 6. Shadows/Midtones/Highlights balance
+  // 6. Shadows/Highlights level (luminance-isolated brightness)
+  ${params.shadowsLevel !== 0 || params.highlightsLevel !== 0 ? `{
+  float lumaLev = luminance(color);
+  float shadowWeight = 1.0 - smoothstepCustom(0.0, 0.5, lumaLev);
+  float highlightWeight = smoothstepCustom(0.5, 1.0, lumaLev);
+  color += ${(params.shadowsLevel / 100).toFixed(6)} * shadowWeight;
+  color += ${(params.highlightsLevel / 100).toFixed(6)} * highlightWeight;
+  color = clamp(color, 0.0, 1.0);
+  }` : '// No shadow/highlight level'}
+
+  // 7. Shadows/Midtones/Highlights balance
   ${[params.shadows, params.midtones, params.highlights].some(v => v.r !== 0 || v.g !== 0 || v.b !== 0) ? `
   float luma2 = luminance(color);
   float sw = 1.0 - smoothstepCustom(0.0, 0.4, luma2);
