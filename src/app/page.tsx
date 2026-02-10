@@ -351,8 +351,7 @@ export default function Home() {
                 href={outputUrl}
                 download={
                   videoFile
-                    ? videoFile.name.replace(/\.[^.]+$/, "_graded") +
-                      (outputUrl.startsWith("blob:") ? ".webm" : ".mp4")
+                    ? videoFile.name.replace(/\.[^.]+$/, "_graded.mp4")
                     : "graded_video.mp4"
                 }
                 className="btn btn-primary text-[11px]"

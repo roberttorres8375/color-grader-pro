@@ -1,13 +1,16 @@
 /**
- * Client-side video processing using WebGL + MediaRecorder.
+ * Client-side video processing using WebGL + WebCodecs + mp4-muxer.
  *
  * Renders each frame through our WebGL color grading shader pipeline,
- * then encodes the result with MediaRecorder (natively supported, no WASM needed).
+ * encodes to H.264 via the browser's hardware-accelerated WebCodecs VideoEncoder,
+ * and muxes into a proper .mp4 file using mp4-muxer.
  *
- * This works everywhere - no SharedArrayBuffer, no FFmpeg.wasm, no COOP/COEP headers.
+ * No SharedArrayBuffer, no FFmpeg.wasm, no COOP/COEP headers needed.
+ * Works in Chrome, Edge, and Safari (16.6+).
  */
 
 import { generateGLSLFragmentShader, VERTEX_SHADER, type GradingParams } from "./color-science";
+import { Muxer, ArrayBufferTarget } from "mp4-muxer";
 
 export type ProgressCallback = (progress: number, message: string) => void;
 
@@ -16,6 +19,14 @@ export async function processVideoClientSide(
   params: GradingParams,
   onProgress: ProgressCallback
 ): Promise<Blob> {
+  // Check for WebCodecs support
+  if (typeof VideoEncoder === "undefined" || typeof VideoFrame === "undefined") {
+    throw new Error(
+      "Your browser does not support WebCodecs (needed for MP4 export). " +
+      "Please use Chrome, Edge, or Safari 16.6+."
+    );
+  }
+
   onProgress(5, "Preparing video...");
 
   // Create a video element to decode the source
@@ -93,63 +104,66 @@ export async function processVideoClientSide(
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
 
-  onProgress(15, "Setting up encoder...");
+  onProgress(15, "Setting up H.264 encoder...");
 
-  // Use MediaRecorder to encode the output
-  const stream = canvas.captureStream(0); // 0 = manual frame capture
+  // Set up mp4-muxer
+  const fps = 30;
+  const totalFrames = Math.ceil(duration * fps);
+  const frameDurationUs = Math.round(1_000_000 / fps); // microseconds per frame
 
-  // Try to get best available codec
-  const mimeTypes = [
-    "video/webm;codecs=vp9",
-    "video/webm;codecs=vp8",
-    "video/webm",
-    "video/mp4",
-  ];
-  let selectedMime = "";
-  for (const mime of mimeTypes) {
-    if (MediaRecorder.isTypeSupported(mime)) {
-      selectedMime = mime;
-      break;
-    }
-  }
-
-  if (!selectedMime) {
-    URL.revokeObjectURL(videoUrl);
-    throw new Error("No supported video encoding format found");
-  }
-
-  const recorder = new MediaRecorder(stream, {
-    mimeType: selectedMime,
-    videoBitsPerSecond: Math.min(width * height * 8, 10_000_000), // Scale bitrate with resolution, cap at 10Mbps
+  const muxer = new Muxer({
+    target: new ArrayBufferTarget(),
+    video: {
+      codec: "avc",
+      width,
+      height,
+    },
+    fastStart: "in-memory",
+    firstTimestampBehavior: "offset",
   });
 
-  const chunks: Blob[] = [];
-  recorder.ondataavailable = (e) => {
-    if (e.data.size > 0) chunks.push(e.data);
-  };
+  // Set up WebCodecs VideoEncoder
+  let encoderError: Error | null = null;
 
-  const recordingDone = new Promise<Blob>((resolve) => {
-    recorder.onstop = () => {
-      const outputMime = selectedMime.split(";")[0]; // e.g., "video/webm"
-      resolve(new Blob(chunks, { type: outputMime }));
-    };
+  const encoder = new VideoEncoder({
+    output: (chunk, meta) => {
+      muxer.addVideoChunk(chunk, meta);
+    },
+    error: (e) => {
+      encoderError = e;
+      console.error("VideoEncoder error:", e);
+    },
   });
 
-  recorder.start();
+  // Configure H.264 encoding
+  // Use dimensions that are even (H.264 requires this)
+  const encWidth = width % 2 === 0 ? width : width + 1;
+  const encHeight = height % 2 === 0 ? height : height + 1;
 
-  // Process frame-by-frame using requestVideoFrameCallback or seek-based approach
+  encoder.configure({
+    codec: "avc1.640028", // H.264 High Profile Level 4.0
+    width: encWidth,
+    height: encHeight,
+    bitrate: Math.min(width * height * 8, 10_000_000), // Scale with resolution, cap 10Mbps
+    framerate: fps,
+    latencyMode: "quality",
+    avc: { format: "avc" }, // Annex B format for mp4-muxer
+  });
+
   onProgress(20, "Processing frames...");
 
-  // Seek-based frame-by-frame processing
-  const fps = 30; // Output at 30fps
-  const totalFrames = Math.ceil(duration * fps);
+  // Process frame-by-frame
   const frameDuration = 1 / fps;
 
   for (let frameIdx = 0; frameIdx < totalFrames; frameIdx++) {
+    if (encoderError) {
+      throw encoderError;
+    }
+
     const time = frameIdx * frameDuration;
     video.currentTime = Math.min(time, duration - 0.001);
 
-    // Wait for the seek to complete and frame to be available
+    // Wait for the seek to complete
     await new Promise<void>((resolve) => {
       const onSeeked = () => {
         video.removeEventListener("seeked", onSeeked);
@@ -185,31 +199,60 @@ export async function processVideoClientSide(
 
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
 
-    // Capture this frame to the MediaRecorder stream
-    const track = stream.getVideoTracks()[0] as any;
-    if (track && typeof track.requestFrame === "function") {
-      track.requestFrame();
+    // Create a VideoFrame from the canvas
+    const frame = new VideoFrame(canvas, {
+      timestamp: frameIdx * frameDurationUs,
+      duration: frameDurationUs,
+    });
+
+    // Encode - request keyframe every 2 seconds
+    const keyFrame = frameIdx % (fps * 2) === 0;
+    encoder.encode(frame, { keyFrame });
+    frame.close();
+
+    // Backpressure: if encoder queue is getting deep, wait for it to catch up
+    if (encoder.encodeQueueSize > 5) {
+      await new Promise<void>((resolve) => {
+        const check = () => {
+          if (encoder.encodeQueueSize <= 2) {
+            resolve();
+          } else {
+            setTimeout(check, 10);
+          }
+        };
+        check();
+      });
     }
 
-    // Small delay to let MediaRecorder process the frame
-    await new Promise<void>((resolve) => setTimeout(resolve, 0));
-
     // Update progress
-    const progress = 20 + (frameIdx / totalFrames) * 75;
+    const progress = 20 + (frameIdx / totalFrames) * 70;
     if (frameIdx % 10 === 0) {
       onProgress(
-        Math.min(95, progress),
+        Math.min(92, progress),
         `Frame ${frameIdx + 1}/${totalFrames}`
       );
     }
   }
 
-  onProgress(95, "Finalizing...");
-  recorder.stop();
+  onProgress(93, "Flushing encoder...");
 
-  const outputBlob = await recordingDone;
+  // Flush the encoder to get all remaining frames
+  await encoder.flush();
+  encoder.close();
 
-  // Cleanup
+  if (encoderError) {
+    throw encoderError;
+  }
+
+  onProgress(96, "Finalizing MP4...");
+
+  // Finalize the MP4 file
+  muxer.finalize();
+
+  const mp4Buffer = (muxer.target as ArrayBufferTarget).buffer;
+  const outputBlob = new Blob([mp4Buffer], { type: "video/mp4" });
+
+  // Cleanup WebGL resources
   gl.deleteTexture(texture);
   gl.deleteBuffer(positionBuffer);
   gl.deleteBuffer(texCoordBuffer);
