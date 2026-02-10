@@ -84,14 +84,16 @@ export default function Home() {
     }
   }, []);
 
-  // Export graded video via server-side FFmpeg
+  // Export graded video - tries server-side first, falls back to client-side FFmpeg.wasm
   const handleExport = useCallback(async () => {
     if (!videoFile) return;
 
     setProcessingState("uploading");
     setProcessingProgress(0);
     setErrorMessage(null);
+    setOutputUrl(null);
 
+    // Try server-side first (works in local dev with FFmpeg installed)
     try {
       const formData = new FormData();
       formData.append("video", videoFile);
@@ -111,7 +113,7 @@ export default function Home() {
       setProcessingState("processing");
 
       // Poll for completion with proper promise handling
-      const waitForCompletion = (): Promise<void> => {
+      const waitForCompletion = (): Promise<string> => {
         return new Promise((resolve, reject) => {
           const poll = async () => {
             try {
@@ -119,10 +121,7 @@ export default function Home() {
               const status = await statusRes.json();
 
               if (status.status === "complete") {
-                setProcessingState("complete");
-                setOutputUrl(status.outputPath);
-                setProcessingProgress(100);
-                resolve();
+                resolve(status.outputPath);
               } else if (status.status === "error") {
                 reject(new Error(status.error || "Server processing failed"));
               } else {
@@ -137,11 +136,41 @@ export default function Home() {
         });
       };
 
-      await waitForCompletion();
-    } catch (error) {
-      console.error("Export error:", error);
+      const serverOutputPath = await waitForCompletion();
+      setProcessingState("complete");
+      setOutputUrl(serverOutputPath);
+      setProcessingProgress(100);
+      return; // Server export succeeded
+    } catch (serverError) {
+      console.warn("Server-side export failed, falling back to client-side:", serverError);
+    }
+
+    // Fall back to client-side FFmpeg.wasm
+    try {
+      setProcessingState("processing");
+      setProcessingProgress(5);
+
+      const { processVideoClientSide } = await import("@/lib/client-processor");
+
+      const outputBlob = await processVideoClientSide(
+        videoFile,
+        params,
+        (progress, message) => {
+          setProcessingProgress(progress);
+          console.log(`[Client FFmpeg] ${message}`);
+        }
+      );
+
+      const url = URL.createObjectURL(outputBlob);
+      setProcessingState("complete");
+      setOutputUrl(url);
+      setProcessingProgress(100);
+    } catch (clientError) {
+      console.error("Client-side export also failed:", clientError);
       setProcessingState("error");
-      setErrorMessage(error instanceof Error ? error.message : "Export failed");
+      setErrorMessage(
+        clientError instanceof Error ? clientError.message : "Export failed"
+      );
     }
   }, [videoFile, params]);
 
@@ -320,7 +349,12 @@ export default function Home() {
               </span>
               <a
                 href={outputUrl}
-                download
+                download={
+                  videoFile
+                    ? videoFile.name.replace(/\.[^.]+$/, "_graded") +
+                      (outputUrl.startsWith("blob:") ? ".webm" : ".mp4")
+                    : "graded_video.mp4"
+                }
                 className="btn btn-primary text-[11px]"
               >
                 Download
