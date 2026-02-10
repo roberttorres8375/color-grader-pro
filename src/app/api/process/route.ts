@@ -18,6 +18,18 @@ const processingJobs = new Map<
 >();
 
 export async function POST(request: NextRequest) {
+  // Check if FFmpeg is available before processing
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  try {
+    const cp = require("child_process");
+    cp.execFileSync("ffmpeg", ["-version"], { stdio: "pipe", timeout: 5000 });
+  } catch {
+    return NextResponse.json(
+      { error: "FFmpeg not available on this server" },
+      { status: 501 }
+    );
+  }
+
   try {
     const formData = await request.formData();
     const videoFile = formData.get("video") as File | null;
