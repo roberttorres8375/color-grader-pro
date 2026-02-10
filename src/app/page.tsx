@@ -64,7 +64,7 @@ export default function Home() {
     }
   }, []);
 
-  // Export graded video
+  // Export graded video - tries server first, falls back to client-side FFmpeg.wasm
   const handleExport = useCallback(async () => {
     if (!videoFile) return;
 
@@ -72,6 +72,7 @@ export default function Home() {
     setProcessingProgress(0);
     setErrorMessage(null);
 
+    // Try server-side first (has FFmpeg installed)
     try {
       const formData = new FormData();
       formData.append("video", videoFile);
@@ -82,15 +83,11 @@ export default function Home() {
         body: formData,
       });
 
-      if (!response.ok) {
-        const err = await response.json();
-        throw new Error(err.error || "Upload failed");
-      }
+      if (!response.ok) throw new Error("Server processing unavailable");
 
       const { jobId } = await response.json();
       setProcessingState("processing");
 
-      // Poll for completion
       const poll = async () => {
         const statusRes = await fetch(`/api/process?jobId=${jobId}`);
         const status = await statusRes.json();
@@ -100,20 +97,38 @@ export default function Home() {
           setOutputUrl(status.outputPath);
           setProcessingProgress(100);
         } else if (status.status === "error") {
-          setProcessingState("error");
-          setErrorMessage(status.error);
+          throw new Error(status.error || "Server processing failed");
         } else {
-          setProcessingProgress(Math.min(90, processingProgress + 10));
+          setProcessingProgress((prev) => Math.min(90, prev + 5));
           setTimeout(poll, 1000);
         }
       };
 
-      poll();
+      await poll();
+      return;
+    } catch {
+      // Fall through to client-side processing
+      console.log("Server-side processing unavailable, using client-side FFmpeg.wasm");
+    }
+
+    // Client-side fallback using FFmpeg.wasm
+    try {
+      setProcessingState("processing");
+      const { processVideoClientSide } = await import("@/lib/client-processor");
+
+      const blob = await processVideoClientSide(videoFile, params, (progress, message) => {
+        setProcessingProgress(progress);
+        console.log(message);
+      });
+
+      const url = URL.createObjectURL(blob);
+      setOutputUrl(url);
+      setProcessingState("complete");
     } catch (error) {
       setProcessingState("error");
       setErrorMessage(error instanceof Error ? error.message : "Export failed");
     }
-  }, [videoFile, params, processingProgress]);
+  }, [videoFile, params]);
 
   // Export LUT
   const handleExportLUT = useCallback(() => {
