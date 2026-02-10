@@ -7,23 +7,8 @@ const nextConfig: NextConfig = {
       bodySizeLimit: "500mb",
     },
   },
-  async headers() {
-    return [
-      {
-        source: "/(.*)",
-        headers: [
-          {
-            key: "Cross-Origin-Opener-Policy",
-            value: "same-origin",
-          },
-          {
-            key: "Cross-Origin-Embedder-Policy",
-            value: "require-corp",
-          },
-        ],
-      },
-    ];
-  },
+  // COOP/COEP headers intentionally omitted - they block blob: URLs in <video>
+  // and break local file loading. Server-side FFmpeg doesn't need them.
 };
 
 export default nextConfig;

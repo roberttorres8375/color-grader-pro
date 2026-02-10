@@ -1,15 +1,21 @@
 import { NextRequest, NextResponse } from "next/server";
-import { exec } from "child_process";
+import { execFile } from "child_process";
 import { promisify } from "util";
 import { writeFile, mkdir, unlink } from "fs/promises";
 import path from "path";
 import { v4 as uuidv4 } from "uuid";
-import { generateFFmpegFilterChain, type GradingParams } from "@/lib/color-science";
+import {
+  generateFFmpegFilterChain,
+  type GradingParams,
+} from "@/lib/color-science";
 
-const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
 
-// Store processing status
-const processingJobs = new Map<string, { status: string; progress: number; outputPath: string | null; error: string | null }>();
+// In-memory job store (single-instance only)
+const processingJobs = new Map<
+  string,
+  { status: string; progress: number; outputPath: string | null; error: string | null }
+>();
 
 export async function POST(request: NextRequest) {
   try {
@@ -25,20 +31,17 @@ export async function POST(request: NextRequest) {
     const params: GradingParams = JSON.parse(paramsJson);
     const jobId = uuidv4();
 
-    // Create temp directories
     const tmpDir = path.join(process.cwd(), "tmp");
     const outputDir = path.join(process.cwd(), "public", "output");
     await mkdir(tmpDir, { recursive: true });
     await mkdir(outputDir, { recursive: true });
 
-    // Save input video
     const inputExt = path.extname(videoFile.name) || ".mp4";
     const inputPath = path.join(tmpDir, `${jobId}_input${inputExt}`);
     const outputPath = path.join(outputDir, `${jobId}_graded.mp4`);
     const arrayBuffer = await videoFile.arrayBuffer();
     await writeFile(inputPath, Buffer.from(arrayBuffer));
 
-    // Save LUT if provided
     let lutPath: string | null = null;
     if (lutFile) {
       lutPath = path.join(tmpDir, `${jobId}_lut.cube`);
@@ -46,35 +49,17 @@ export async function POST(request: NextRequest) {
       await writeFile(lutPath, Buffer.from(lutBuffer));
     }
 
-    // Initialize job status
     processingJobs.set(jobId, { status: "processing", progress: 0, outputPath: null, error: null });
 
-    // Build FFmpeg command
-    const filterChain = generateFFmpegFilterChain(params);
-
-    // If we have a LUT, apply it after the filter chain
-    let fullFilter = filterChain;
+    let filterChain = generateFFmpegFilterChain(params);
     if (lutPath) {
-      fullFilter = fullFilter === "null"
-        ? `lut3d='${lutPath}'`
-        : `${fullFilter},lut3d='${lutPath}'`;
+      filterChain = filterChain === "null"
+        ? `lut3d=${lutPath}`
+        : `${filterChain},lut3d=${lutPath}`;
     }
 
-    const ffmpegCmd = [
-      "ffmpeg",
-      "-y",
-      "-i", `"${inputPath}"`,
-      "-vf", `"${fullFilter}"`,
-      "-c:v", "libx264",
-      "-preset", "fast",
-      "-crf", "18",
-      "-c:a", "copy",
-      "-movflags", "+faststart",
-      `"${outputPath}"`,
-    ].join(" ");
-
-    // Run FFmpeg asynchronously
-    processVideo(jobId, ffmpegCmd, inputPath, outputPath);
+    // Fire and forget - don't await
+    processVideo(jobId, inputPath, outputPath, filterChain);
 
     return NextResponse.json({ jobId });
   } catch (error) {
@@ -86,10 +71,28 @@ export async function POST(request: NextRequest) {
   }
 }
 
-async function processVideo(jobId: string, cmd: string, inputPath: string, outputPath: string) {
+async function processVideo(
+  jobId: string,
+  inputPath: string,
+  outputPath: string,
+  filterChain: string
+) {
   try {
-    console.log("FFmpeg command:", cmd);
-    await execAsync(cmd, { maxBuffer: 1024 * 1024 * 10 });
+    // execFile avoids shell interpretation - no quoting issues with paths or filters
+    const args = [
+      "-y",
+      "-i", inputPath,
+      "-vf", filterChain,
+      "-c:v", "libx264",
+      "-preset", "fast",
+      "-crf", "18",
+      "-c:a", "copy",
+      "-movflags", "+faststart",
+      outputPath,
+    ];
+
+    console.log("FFmpeg args:", JSON.stringify(args));
+    await execFileAsync("ffmpeg", args, { maxBuffer: 1024 * 1024 * 50 });
 
     processingJobs.set(jobId, {
       status: "complete",
@@ -98,8 +101,7 @@ async function processVideo(jobId: string, cmd: string, inputPath: string, outpu
       error: null,
     });
 
-    // Cleanup input
-    try { await unlink(inputPath); } catch { /* ignore */ }
+    try { await unlink(inputPath); } catch { /* ok */ }
   } catch (error) {
     console.error("FFmpeg error:", error);
     processingJobs.set(jobId, {

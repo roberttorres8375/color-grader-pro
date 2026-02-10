@@ -176,22 +176,16 @@ export const PRESETS: Preset[] = [
 export function generateFFmpegFilterChain(params: GradingParams): string {
   const filters: string[] = [];
 
-  // 1. Exposure - use eq filter for brightness as EV stops
-  // exposure = 2^EV, so EV=1 doubles brightness
+  // 1. Exposure via eq filter (brightness is a multiplier around 1.0 in eq)
   if (params.exposure !== 0) {
+    // eq brightness range is -1.0 to 1.0 (additive to luma), but
+    // we use the gamma parameter for multiplicative-like control.
+    // For a proper EV stop: multiply by 2^EV
     const brightness = Math.pow(2, params.exposure);
-    // eq brightness is additive (-1 to 1), but we want multiplicative
-    // Use curves for true multiplicative exposure
-    const r = Math.min(1, brightness);
-    const g = Math.min(1, brightness);
-    const b = Math.min(1, brightness);
-    if (brightness <= 1) {
-      filters.push(`curves=r='0/0 1/${r}':g='0/0 1/${g}':b='0/0 1/${b}'`);
-    } else {
-      // For overexposure, use lut to multiply
-      const factor = brightness;
-      filters.push(`lut=r='clip(val*${factor.toFixed(4)},0,255)':g='clip(val*${factor.toFixed(4)},0,255)':b='clip(val*${factor.toFixed(4)},0,255)'`);
-    }
+    // eq gamma: lower = brighter. gamma = 1/brightness gives us the right mapping.
+    // But eq also has a 'brightness' param that is additive.
+    // Simplest correct approach: use lut filter for direct multiplication.
+    filters.push(`lut=r=clip(val*${brightness.toFixed(4)}\\,0\\,255):g=clip(val*${brightness.toFixed(4)}\\,0\\,255):b=clip(val*${brightness.toFixed(4)}\\,0\\,255)`);
   }
 
   // 2. Lift/Gamma/Gain
@@ -226,7 +220,8 @@ export function generateFFmpegFilterChain(params: GradingParams): string {
         y = Math.max(0, Math.min(1, y));
         points.push(`${x.toFixed(3)}/${y.toFixed(3)}`);
       }
-      filters.push(`curves=${ch}='${points.join(" ")}'`);
+      // No quotes needed - execFile passes args directly without shell
+      filters.push(`curves=${ch}=${points.join(" ")}`);
     }
   }
 
@@ -263,7 +258,7 @@ export function generateFFmpegFilterChain(params: GradingParams): string {
       y = Math.max(0, Math.min(1, y));
       points.push(`${x.toFixed(3)}/${y.toFixed(3)}`);
     }
-    filters.push(`curves=all='${points.join(" ")}'`);
+    filters.push(`curves=all=${points.join(" ")}`);
   }
 
   // 5. Saturation

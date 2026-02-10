@@ -31,21 +31,41 @@ export default function Home() {
 
   // Handle video file selection
   const handleVideoFile = useCallback((file: File) => {
+    // Revoke previous URL to avoid memory leak
+    if (videoUrl) {
+      URL.revokeObjectURL(videoUrl);
+    }
     const url = URL.createObjectURL(file);
     setVideoUrl(url);
     setVideoFile(file);
     setProcessingState("idle");
     setOutputUrl(null);
     setErrorMessage(null);
-  }, []);
+  }, [videoUrl]);
 
   // Drag & drop handling
+  const handleDragOver = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragOver(true);
+  }, []);
+
+  const handleDragLeave = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    // Only set false if we're leaving the container, not entering a child
+    if (e.currentTarget === e.target) {
+      setIsDragOver(false);
+    }
+  }, []);
+
   const handleDrop = useCallback(
     (e: React.DragEvent) => {
       e.preventDefault();
+      e.stopPropagation();
       setIsDragOver(false);
       const file = e.dataTransfer.files[0];
-      if (file && file.type.startsWith("video/")) {
+      if (file && (file.type.startsWith("video/") || file.name.match(/\.(mp4|mov|webm|avi|mkv)$/i))) {
         handleVideoFile(file);
       }
     },
@@ -57,14 +77,14 @@ export default function Home() {
     if (previewRef.current) {
       const pixels = previewRef.current.getPixels();
       const size = previewRef.current.getSize();
-      if (pixels) {
+      if (pixels && size.width > 0 && size.height > 0) {
         setScopePixels(pixels);
         setScopeSize(size);
       }
     }
   }, []);
 
-  // Export graded video - tries server first, falls back to client-side FFmpeg.wasm
+  // Export graded video via server-side FFmpeg
   const handleExport = useCallback(async () => {
     if (!videoFile) return;
 
@@ -72,7 +92,6 @@ export default function Home() {
     setProcessingProgress(0);
     setErrorMessage(null);
 
-    // Try server-side first (has FFmpeg installed)
     try {
       const formData = new FormData();
       formData.append("video", videoFile);
@@ -83,48 +102,44 @@ export default function Home() {
         body: formData,
       });
 
-      if (!response.ok) throw new Error("Server processing unavailable");
+      if (!response.ok) {
+        const err = await response.json();
+        throw new Error(err.error || "Upload failed");
+      }
 
       const { jobId } = await response.json();
       setProcessingState("processing");
 
-      const poll = async () => {
-        const statusRes = await fetch(`/api/process?jobId=${jobId}`);
-        const status = await statusRes.json();
+      // Poll for completion with proper promise handling
+      const waitForCompletion = (): Promise<void> => {
+        return new Promise((resolve, reject) => {
+          const poll = async () => {
+            try {
+              const statusRes = await fetch(`/api/process?jobId=${jobId}`);
+              const status = await statusRes.json();
 
-        if (status.status === "complete") {
-          setProcessingState("complete");
-          setOutputUrl(status.outputPath);
-          setProcessingProgress(100);
-        } else if (status.status === "error") {
-          throw new Error(status.error || "Server processing failed");
-        } else {
-          setProcessingProgress((prev) => Math.min(90, prev + 5));
-          setTimeout(poll, 1000);
-        }
+              if (status.status === "complete") {
+                setProcessingState("complete");
+                setOutputUrl(status.outputPath);
+                setProcessingProgress(100);
+                resolve();
+              } else if (status.status === "error") {
+                reject(new Error(status.error || "Server processing failed"));
+              } else {
+                setProcessingProgress((prev) => Math.min(90, prev + 5));
+                setTimeout(poll, 1500);
+              }
+            } catch (e) {
+              reject(e);
+            }
+          };
+          poll();
+        });
       };
 
-      await poll();
-      return;
-    } catch {
-      // Fall through to client-side processing
-      console.log("Server-side processing unavailable, using client-side FFmpeg.wasm");
-    }
-
-    // Client-side fallback using FFmpeg.wasm
-    try {
-      setProcessingState("processing");
-      const { processVideoClientSide } = await import("@/lib/client-processor");
-
-      const blob = await processVideoClientSide(videoFile, params, (progress, message) => {
-        setProcessingProgress(progress);
-        console.log(message);
-      });
-
-      const url = URL.createObjectURL(blob);
-      setOutputUrl(url);
-      setProcessingState("complete");
+      await waitForCompletion();
     } catch (error) {
+      console.error("Export error:", error);
       setProcessingState("error");
       setErrorMessage(error instanceof Error ? error.message : "Export failed");
     }
@@ -138,7 +153,9 @@ export default function Home() {
     const a = document.createElement("a");
     a.href = url;
     a.download = "colorgrader_export.cube";
+    document.body.appendChild(a);
     a.click();
+    document.body.removeChild(a);
     URL.revokeObjectURL(url);
   }, [params]);
 
@@ -147,21 +164,35 @@ export default function Home() {
     const content = await file.text();
     const lut = parseCubeLUT(content);
     if (lut) {
-      // For now, just store it - in production you'd apply it via WebGL texture lookup
-      alert(`LUT imported: ${lut.size}x${lut.size}x${lut.size} (${lut.data.length / 3} entries). LUT will be applied during export.`);
+      alert(
+        `LUT imported: ${lut.size}x${lut.size}x${lut.size} (${lut.data.length / 3} entries). LUT will be applied during export.`
+      );
     } else {
-      alert("Failed to parse .cube LUT file");
+      alert("Failed to parse .cube LUT file. Check the file format.");
     }
   }, []);
 
-  // Keyboard shortcuts
+  // Keyboard shortcuts - only fire when not focused on an input
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement;
+      if (
+        target.tagName === "INPUT" ||
+        target.tagName === "TEXTAREA" ||
+        target.tagName === "SELECT" ||
+        target.isContentEditable
+      ) {
+        return;
+      }
+
       if (e.key === "c" && !e.metaKey && !e.ctrlKey) {
         setShowComparison((v) => !v);
       }
       if (e.key === "r" && !e.metaKey && !e.ctrlKey) {
         setParams({ ...DEFAULT_PARAMS });
+      }
+      if (e.key === " " && !e.metaKey && !e.ctrlKey) {
+        e.preventDefault(); // prevent page scroll
       }
     };
     window.addEventListener("keydown", handler);
@@ -171,16 +202,13 @@ export default function Home() {
   return (
     <div
       className="h-screen flex flex-col"
-      onDragOver={(e) => {
-        e.preventDefault();
-        setIsDragOver(true);
-      }}
-      onDragLeave={() => setIsDragOver(false)}
+      onDragOver={handleDragOver}
+      onDragLeave={handleDragLeave}
       onDrop={handleDrop}
     >
       {/* Drag overlay */}
       {isDragOver && (
-        <div className="drag-overlay">
+        <div className="drag-overlay pointer-events-none">
           Drop video file to load
         </div>
       )}
@@ -195,7 +223,6 @@ export default function Home() {
         </div>
 
         <div className="flex items-center gap-2">
-          {/* Comparison toggle */}
           <button
             onClick={() => setShowComparison(!showComparison)}
             className={`btn text-[11px] ${showComparison ? "btn-primary" : ""}`}
@@ -204,15 +231,16 @@ export default function Home() {
             {showComparison ? "Comparing" : "Compare"}
           </button>
 
-          {/* File input */}
           <input
             ref={fileInputRef}
             type="file"
-            accept="video/*"
+            accept="video/*,.mp4,.mov,.webm,.avi,.mkv"
             className="hidden"
             onChange={(e) => {
               const file = e.target.files?.[0];
               if (file) handleVideoFile(file);
+              // Reset so the same file can be selected again
+              e.target.value = "";
             }}
           />
           <button
@@ -222,10 +250,13 @@ export default function Home() {
             Load Video
           </button>
 
-          {/* Export button */}
           <button
             onClick={handleExport}
-            disabled={!videoFile || processingState === "processing" || processingState === "uploading"}
+            disabled={
+              !videoFile ||
+              processingState === "processing" ||
+              processingState === "uploading"
+            }
             className="btn btn-primary text-[11px]"
           >
             {processingState === "uploading"
@@ -260,11 +291,14 @@ export default function Home() {
           />
 
           {/* Processing status */}
-          {(processingState === "processing" || processingState === "uploading") && (
-            <div className="bg-[#111] border-t border-[#222] px-4 py-2">
+          {(processingState === "processing" ||
+            processingState === "uploading") && (
+            <div className="bg-[#111] border-t border-[#222] px-4 py-2 shrink-0">
               <div className="flex items-center gap-3">
                 <span className="text-[11px] text-[#888]">
-                  {processingState === "uploading" ? "Uploading..." : "Processing..."}
+                  {processingState === "uploading"
+                    ? "Uploading..."
+                    : "Processing..."}
                 </span>
                 <div className="progress-bar flex-1">
                   <div
@@ -280,8 +314,10 @@ export default function Home() {
           )}
 
           {processingState === "complete" && outputUrl && (
-            <div className="bg-[#0a1a0a] border-t border-[#1a3a1a] px-4 py-2 flex items-center gap-3">
-              <span className="text-[11px] text-[#4aff7a]">Export complete!</span>
+            <div className="bg-[#0a1a0a] border-t border-[#1a3a1a] px-4 py-2 flex items-center gap-3 shrink-0">
+              <span className="text-[11px] text-[#4aff7a]">
+                Export complete!
+              </span>
               <a
                 href={outputUrl}
                 download
@@ -293,8 +329,10 @@ export default function Home() {
           )}
 
           {processingState === "error" && errorMessage && (
-            <div className="bg-[#1a0a0a] border-t border-[#3a1a1a] px-4 py-2">
-              <span className="text-[11px] text-[#ff4a4a]">Error: {errorMessage}</span>
+            <div className="bg-[#1a0a0a] border-t border-[#3a1a1a] px-4 py-2 shrink-0">
+              <span className="text-[11px] text-[#ff4a4a]">
+                Error: {errorMessage}
+              </span>
             </div>
           )}
         </main>
@@ -307,10 +345,11 @@ export default function Home() {
             height={scopeSize.height}
           />
 
-          {/* Keyboard shortcuts reference */}
           <div className="p-3 mt-auto border-t border-[#222]">
             <div className="text-[10px] text-[#444] space-y-1">
-              <p className="font-medium text-[#555] uppercase tracking-wider mb-2">Shortcuts</p>
+              <p className="font-medium text-[#555] uppercase tracking-wider mb-2">
+                Shortcuts
+              </p>
               <div className="flex justify-between">
                 <span>Toggle compare</span>
                 <kbd className="bg-[#222] px-1.5 rounded text-[9px]">C</kbd>
